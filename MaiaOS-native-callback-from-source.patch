@@ -1,0 +1,185 @@
+--- a/src/build.py
++++ b/src/build.py
+@@ -118,7 +118,7 @@
+     # Scope here while w1 is still the physical pad, before native up replaces
+     # it with the selected sample at +0x158. Includes zero/negative releases.
+     s+='.global pc_gate_tune_input\n.hidden pc_gate_tune_input\npc_gate_tune_input:\n'+save
+-    s+=' mov w0,w1\n mov x1,#0\n fcmp s0,#0\n cset w2,le\n bl pc_loader_pad_enter\n str w0,[sp,#168]\n'+reload
++    s+=' mov w0,w1\n mov x1,#0\n fcmp s0,#0.0\n cset w2,le\n bl pc_loader_pad_enter\n str w0,[sp,#168]\n'+reload
+     s+=' bl pc_tune_input_replay\n ldr w0,[sp,#168]\n bl pc_loader_pad_leave\n'+restore+' hint #29\n ret\n'
+     s+='pc_tune_input_replay:\n hint #25\n b '+target('tune_input',0x6d42680)+'\n'
+     # Capture the existing CurrentTrack dependency after the constructor stores it.
+@@ -190,46 +190,12 @@
+     for name,site in [('physical',0x1390548),('rotation',0x140dbc0),('knob0',0x6d42700),('knob1',0x6d42720),('knob2',0x6d42740),('pad_down',0x1548ae4),('pad_pressure',0x1548a64),('pad_up',0x1548994)]:branch(name,site,symbols['pc_gate_'+name])
+     branch('sample_import_toggle',0x14ab584,symbols['pc_gate_sample_import'],pre='e20300aa')
+     branch('tune_queued_input',0x1545054,symbols['pc_gate_tune_input'])
+-    # Redirect the queue's function pointer/branch to our callback while leaving
+-    # the old callback body available as a complete fallback.
+-    old=0x6d43600;refs=[]
+-    for addr,off in relocations.items():
+-        if struct.unpack_from('<Q',parent,off)[0]==old:refs.append(off)
+-    # The callback address is materialized by ADRP/ADD in the enqueue thunk.
+-    from capstone import Cs,CS_ARCH_ARM64,CS_MODE_ARM
+-    md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
+-    callback_code=parent[0x6d43500:0x6d43600];instructions=list(md.disasm(callback_code,0x6d43500))
+-    found=False
+-    for ix,ins in enumerate(instructions[:-1]):
+-        if ins.mnemonic=='adrp':
+-            nxt=instructions[ix+1]
+-            if ins.op_str.split(',')[0]=='x3' and nxt.mnemonic=='add' and 'x3, x3' in nxt.op_str:
+-                # Filled below only for a proven exact old callback constant.
+-                pass
+-    # Stable queue target trampoline: replace BTI at old callback with a branch
+-    # and preserve an out-of-line copy of its entire original 0xf0-byte body.
+-    # Its internal B/BL are PC-relative, so reassemble them at the appended RVA.
+-    callback_copy=START+len(blob);callback_copy=(callback_copy+15)&~15
++    from v064_callback import build_callback
++    old=0x6d43600
++    callback_copy=(START+len(blob)+15)&~15
+     blob+=bytes(callback_copy-START-len(blob))
+-    from keystone import Ks,KS_ARCH_ARM64,KS_MODE_LITTLE_ENDIAN
+-    ks=Ks(KS_ARCH_ARM64,KS_MODE_LITTLE_ENDIAN)
+-    body=parent[old:old+0xec];moved=bytearray()
+-    for ins in md.disasm(body,old):
+-        dest=callback_copy+ins.address-old
+-        if ins.mnemonic in ('b','bl','b.eq','b.ne','b.hs','cbz','cbnz'):
+-            operands=ins.op_str
+-            if ins.mnemonic.startswith('b'):
+-                target=int(operands.lstrip('#'),0)
+-                if old<=target<old+len(body):target=callback_copy+target-old
+-                operands=hex(target)
+-            else:
+-                reg,value=operands.split(', ');target=int(value.lstrip('#'),0)
+-                if old<=target<old+len(body):target=callback_copy+target-old
+-                operands=reg+', '+hex(target)
+-            moved+=bytes(ks.asm(ins.mnemonic+' '+operands,dest)[0])
+-        elif ins.mnemonic=='adrp':moved+=bytes(ks.asm(ins.mnemonic+' '+ins.op_str,dest)[0])
+-        else:moved+=ins.bytes
+-    assert len(moved)==len(body);blob+=moved
++    blob+=build_callback(a.zig,out,callback_copy)
++    found=False
+     # Rewrite the loader gate's fallback B from old callback to the moved body.
+     gate_start=symbols['pc_gate_event']-START
+     for offset in range(gate_start,len(blob)-4,4):
+--- a/src/build_chords.py
++++ b/src/build_chords.py
+@@ -21,7 +21,7 @@
+     assert s['sh_type']!='SHT_NOBITS' or not s['sh_size'];blob[s['sh_addr']-start:s['sh_addr']-start+s['sh_size']]=s.data()
+    return start,blob,symbols,globals
+  start,blob,symbols,globals=read(out/'chords.elf');assert start==BASE and BASE+len(blob)<WRAP
+- asm='.text\n';extern={name:value for name,value in globals.items()}
++ asm='.text\n';extern={name:value for name,value in globals.items()};extern['pr_imagebase']=symbols['pr_imagebase']
+  save='sub sp,sp,#304\nstp x29,x30,[sp]\nmov x29,sp\n'
+  for n in range(0,18,2):save+=f'stp x{n},x{n+1},[sp,#{16+8*n}]\n'
+  save+='str x18,[sp,#160]\n'
+--- /dev/null
++++ b/src/v064_callback.S
+@@ -0,0 +1,70 @@
++.text
++.global maia_v064_callback
++maia_v064_callback:
++
++ hint #34
++ hint #25
++ stp x29,x30,[sp,#-0x20]!
++ mov x29,sp
++ str x19,[sp,#0x10]
++ ldr x9,[x0]
++ lsr x2,x9,#32
++ and w1,w9,#1
++ lsr w9,w9,#1
++ adrp x19,callback_target_72a4000
++ add x19,x19,#0xcb0
++ ldr w10,[x19,#0x1808]
++ add w10,w10,#1
++ str w10,[x19,#0x1808]
++ ldr x0,[x19,#0x20]
++ cmp w9,#10
++ b.eq rotation
++ cmp w9,#9
++ b.eq browser
++ cmp w9,#6
++ b.hs knob
++ cmp w9,#5
++ b.eq shift
++ cmp w9,#4
++ b.eq clip
++ cmp w9,#3
++ b.eq erase
++ cmp w9,#2
++ b.eq chord
++ cbnz w9,button_two
++ bl callback_target_740634c
++ b done
++button_two:
++ bl callback_target_7401754
++ b done
++chord:
++ bl callback_target_7400100
++ b done
++erase:
++ bl callback_target_7401c88
++ b done
++clip:
++ bl callback_target_7403f04
++ b done
++shift:
++ bl callback_target_7403e94
++ b done
++browser:
++ bl callback_target_7406428
++ b done
++rotation:
++ mov w0,w2
++ bl callback_target_7406644
++ b done
++knob:
++ sub w1,w9,#6
++ fmov s0,w2
++ bl callback_target_7404658
++done:
++ str w0,[x19,#0x180c]
++ ldr x19,[sp,#0x10]
++ ldp x29,x30,[sp],#0x20
++ hint #29
++ ret
++
++
+--- /dev/null
++++ b/src/v064_callback.py
+@@ -0,0 +1,35 @@
++"""Assemble and link the MaiaOS v064 callback at its final address."""
++from pathlib import Path
++import subprocess
++
++from elftools.elf.elffile import ELFFile
++
++
++def build_callback(zig, output, address):
++    source = Path(__file__).with_suffix(".S")
++    obj = output / "v064-callback.o"
++    elf = output / "v064-callback.elf"
++    layout = output / "v064-callback.ld"
++    definitions = """callback_target_72a4000 = 0x72a4000;
++callback_target_7400100 = 0x7400100;
++callback_target_7401754 = 0x7401754;
++callback_target_7401c88 = 0x7401c88;
++callback_target_7403e94 = 0x7403e94;
++callback_target_7403f04 = 0x7403f04;
++callback_target_7404658 = 0x7404658;
++callback_target_740634c = 0x740634c;
++callback_target_7406428 = 0x7406428;
++callback_target_7406644 = 0x7406644;
++"""
++    layout.write_text(
++        f"SECTIONS {{ . = {address:#x}; .text : {{ *(.text) }} }}\n" + definitions
++    )
++    subprocess.run([zig, "cc", "-target", "aarch64-linux-none", "-c", str(source),
++                    "-o", str(obj)], check=True)
++    subprocess.run([zig, "ld.lld", "-e", "maia_v064_callback", "-T", str(layout),
++                    str(obj), "-o", str(elf)], check=True)
++    with elf.open("rb") as stream:
++        section = ELFFile(stream).get_section_by_name(".text")
++        if section["sh_addr"] != address or section["sh_size"] != 220:
++            raise ValueError("Unexpected v064 callback layout")
++        return section.data() + bytes(16)
