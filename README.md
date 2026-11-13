@@ -2,7 +2,7 @@
 
 MaiaOS extends the Akai MPC Sample. This preview targets stock firmware **1.3.0.12** and includes the r109 host source, selected runtime sources, and the English installation and operating guides.
 
-**Release status:** The full r109 is not yet installable from this archive and a stock MPC alone. The SD preparation instructions require a separately held private r109 runtime. The source preview contains no Akai firmware, stock executable or stock assets, private runtime, or generated boot files.
+**Release status:** The first beta is out now in releases
 
 ## Get started
 
